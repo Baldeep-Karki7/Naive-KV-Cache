@@ -849,7 +849,7 @@ class QwenForCausalLM(nn.Module):
         input_string_ids = input_ids
         print(f'Status : use_cache is {use_cache}')
 
-        root_dir = 'metrics_new'
+        root_dir = './metrics_new'
         os.makedirs(root_dir, exist_ok = True)
         if use_cache:
             label = f'cache_{max_new_tokens}.json'
