@@ -1,76 +1,21 @@
+import os
 import time
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import os
-import json
 
-def print_and_save_metrics(prefill_metrics, decode_metrics, file_path=None):
-    prefill_time = (prefill_metrics['prefill_end'] -  prefill_metrics['prefill_start'])* 1000
-    ttft = prefill_metrics['ttft'] *  1000
-    decode_time = decode_metrics['decode_time'] * 1000
-    itl = decode_metrics['decode_time'] / decode_metrics['num_tokens']
-    e2e_latency = decode_metrics['decode_end'] - prefill_metrics['prefill_start']
-    
-    print(f'prefill_time = {prefill_time:.3f}ms')
-    print(f'ttft = {ttft:.3f}ms')
-    print(f'decode_time = {decode_time:.3f}ms')
-    print(f'itl = {itl * 1000:.3f} ms')
-    print(f'e2e_latency = {e2e_latency*1000:.3f}ms')
-    print(f'Peak memory usage = {decode_metrics['peak_memory_usage']:.3f} GB')
-
-    #create a dict and save
-
-    metrics = {
-        'prefill_time' : prefill_time,
-        'ttft' :  ttft,
-        'decode_time' : decode_time,
-        'itl' : itl,
-        'e2e_latency' : e2e_latency,
-        'peak_memory_usage_in_GB' : decode_metrics['peak_memory_usage']
-    }
-
-    with open(file_path, "w") as file:
-        json.dump(metrics, file)
-        print(f'Metrics saved')
+from cache import LayerCache, KV_cache
+from save_metrics import sample_next_token, print_and_save_metrics
 
 
-def sample_next_token(logits, temperature=1.0, top_k=0, top_p=1.0):
-    """
-    logits: [B, vocab_size] (already sliced to the last position)
-    """
-    if temperature <= 0:
-        # temperature=0 means greedy, keep that escape hatch
-        return torch.argmax(logits, dim=-1, keepdim=True)
-
-    logits = logits / temperature
-
-    if top_k > 0:
-        top_k = min(top_k, logits.size(-1))
-        kth_val = torch.topk(logits, top_k, dim=-1).values[:, -1, None]
-        logits = logits.masked_fill(logits < kth_val, float('-inf'))
-
-    if top_p < 1.0:
-        sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
-        probs = F.softmax(sorted_logits, dim=-1)
-        cum_probs = torch.cumsum(probs, dim=-1)
-
-        # remove tokens with cumulative prob above top_p, but always keep the first
-        sorted_mask = cum_probs > top_p
-        sorted_mask[:, 1:] = sorted_mask[:, :-1].clone()
-        sorted_mask[:, 0] = False
-
-        sorted_logits = sorted_logits.masked_fill(sorted_mask, float('-inf'))
-        logits = torch.full_like(logits, float('-inf')).scatter(-1, sorted_idx, sorted_logits)
-
-    probs = F.softmax(logits, dim=-1)
-    return torch.multinomial(probs, num_samples=1)
-
-
-
-# RMSNorm
-
+def synchronize():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    elif torch.backends.mps.is_available():
+        torch.mps.synchronize()
+    else:
+        torch.cpu.synchronize()
 
 class RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -84,9 +29,9 @@ class RMSNorm(nn.Module):
         return self.weight * x
 
 
-
+# ============================================================
 # Rotary Positional Embedding
-
+# ============================================================
 
 class RotaryEmbedding(nn.Module):
     def __init__(self, head_dim, max_position_embeddings=32768, theta=1000000.0):
@@ -145,8 +90,10 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     return q, k
 
 
+# ============================================================
+# GQA helper
+# ============================================================
 
-# GQA repeat_kv 
 def repeat_kv(hidden_states, n_rep):
     """
     hidden_states:
@@ -179,7 +126,9 @@ def repeat_kv(hidden_states, n_rep):
     )
 
 
+# ============================================================
 # Qwen Attention
+# ============================================================
 
 class QwenAttention(nn.Module):
 
@@ -203,48 +152,32 @@ class QwenAttention(nn.Module):
             num_attention_heads // num_key_value_heads
         )
 
-        #separate projections
-        self.q_proj = nn.Linear(
-            hidden_size,
-            num_attention_heads * head_dim,
-            bias=True,
-        )
+        # Qwen uses separate projections
+        self.q_proj = nn.Linear(hidden_size, num_attention_heads * head_dim, bias=True,)
 
-        self.k_proj = nn.Linear(
-            hidden_size,
-            num_key_value_heads * head_dim,
-            bias=True,
-        )
+        self.k_proj = nn.Linear( hidden_size, num_key_value_heads * head_dim, bias=True,)
 
-        self.v_proj = nn.Linear(
-            hidden_size,
-            num_key_value_heads * head_dim,
-            bias=True,
-        )
+        self.v_proj = nn.Linear( hidden_size, num_key_value_heads * head_dim, bias=True,)
 
-        self.o_proj = nn.Linear(
-            num_attention_heads * head_dim,
-            hidden_size,
-            bias=False,
-        )
+        self.o_proj = nn.Linear(num_attention_heads * head_dim, hidden_size, bias=False,)
 
-        self.rotary_emb = RotaryEmbedding(
-            head_dim=head_dim,
-            max_position_embeddings=max_position_embeddings,
-            theta=rope_theta,
-        )
+        self.rotary_emb = RotaryEmbedding( head_dim=head_dim, max_position_embeddings=max_position_embeddings, theta=rope_theta,)
 
     def forward(self, hidden_states, position_ids):
 
         batch_size, seq_len, _ = hidden_states.shape
-       
+
+        # ----------------------------------------------------
         # QKV projections
+        # ----------------------------------------------------
+
         q = self.q_proj(hidden_states)
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
 
-        
+        # ----------------------------------------------------
         # Reshape into heads
+        # ----------------------------------------------------
 
         q = q.view(
             batch_size,
@@ -267,8 +200,9 @@ class QwenAttention(nn.Module):
             self.head_dim,
         ).transpose(1, 2)
 
+        # ----------------------------------------------------
         # RoPE
-
+        # ----------------------------------------------------
 
         cos, sin = self.rotary_emb(
             q,
@@ -282,24 +216,19 @@ class QwenAttention(nn.Module):
             sin,
         )
 
+        # ----------------------------------------------------
         # GQA
+        # ----------------------------------------------------
 
-        k = repeat_kv(
-            k,
-            self.num_key_value_groups,
-        )
+        k = repeat_kv(k, self.num_key_value_groups)
 
-        v = repeat_kv(
-            v,
-            self.num_key_value_groups,
-        )
+        v = repeat_kv(v, self.num_key_value_groups)
 
+        # ----------------------------------------------------
         # Attention
+        # ----------------------------------------------------
 
-        scores = torch.matmul(
-            q,
-            k.transpose(-2, -1),
-        )
+        scores = torch.matmul(q, k.transpose(-2, -1) )
 
         scores = scores / math.sqrt(self.head_dim)
 
@@ -319,17 +248,13 @@ class QwenAttention(nn.Module):
             torch.finfo(scores.dtype).min,
         )
 
-        attention_weights = F.softmax(
-            scores,
-            dim=-1,
-        )
+        attention_weights = F.softmax(scores, dim=-1,)
 
-        output = torch.matmul(
-            attention_weights,
-            v,
-        )
+        output = torch.matmul(attention_weights, v,)
 
+        # ----------------------------------------------------
         # Merge heads
+        # ----------------------------------------------------
 
         output = output.transpose(1, 2).contiguous()
 
@@ -344,8 +269,9 @@ class QwenAttention(nn.Module):
         return output
 
 
-
+# ============================================================
 # Qwen MLP / SwiGLU
+# ============================================================
 
 class QwenMLP(nn.Module):
 
@@ -377,16 +303,14 @@ class QwenMLP(nn.Module):
     def forward(self, x):
 
         gate = self.gate_proj(x)
-
         up = self.up_proj(x)
-
         x = F.silu(gate) * up
-
         x = self.down_proj(x)
-
         return x
 
+# ============================================================
 # Decoder Layer
+# ============================================================
 
 class QwenDecoderLayer(nn.Module):
 
@@ -429,7 +353,9 @@ class QwenDecoderLayer(nn.Module):
 
     def forward(self, hidden_states, position_ids):
 
+        # ----------------------------------------------------
         # Attention block
+        # ----------------------------------------------------
 
         residual = hidden_states
 
@@ -444,7 +370,10 @@ class QwenDecoderLayer(nn.Module):
 
         hidden_states = residual + hidden_states
 
+        # ----------------------------------------------------
         # MLP block
+        # ----------------------------------------------------
+
         residual = hidden_states
 
         hidden_states = self.post_attention_layernorm(
@@ -460,8 +389,9 @@ class QwenDecoderLayer(nn.Module):
         return hidden_states
 
 
-
+# ============================================================
 # Qwen Transformer
+# ============================================================
 
 class QwenModel(nn.Module):
 
@@ -500,14 +430,17 @@ class QwenModel(nn.Module):
 
         batch_size, seq_len = input_ids.shape
 
-        
+        # ----------------------------------------------------
         # Token embeddings
+        # ----------------------------------------------------
 
         hidden_states = self.embed_tokens(
             input_ids
         )
 
+        # ----------------------------------------------------
         # Position IDs
+        # ----------------------------------------------------
 
         position_ids = torch.arange(
             seq_len,
@@ -519,7 +452,10 @@ class QwenModel(nn.Module):
             -1,
         )
 
+        # ----------------------------------------------------
         # Transformer layers
+        # ----------------------------------------------------
+
         for layer in self.layers:
 
             hidden_states = layer(
@@ -527,30 +463,30 @@ class QwenModel(nn.Module):
                 position_ids,
             )
 
+        # ----------------------------------------------------
         # Final normalization
+        # ----------------------------------------------------
+
         hidden_states = self.norm(
             hidden_states
         )
 
         return hidden_states
 
-def synchronize():
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    elif torch.backends.mps.is_available():
-        torch.mps.synchronize()
-    else:
-        torch.cpu.synchronize() #never tested with this
 
+# ============================================================
 # Full Causal LM
+# ============================================================
+
 class QwenForCausalLM(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, device):
         super().__init__()
         self.config =  config
         self.model = QwenModel(config)
         
         self.vocab_size = config["vocab_size"]
+        self.kv_cache = KV_cache(config, device)
 
     def forward(self, input_ids):
 
@@ -584,7 +520,7 @@ class QwenForCausalLM(nn.Module):
                 input_ids = input_ids
             )
 
-            synchronize()
+            #torch.cuda.synchronize()
             prefill_end = time.perf_counter()
             prefill_time = prefill_end - prefill_start
             
@@ -650,8 +586,7 @@ class QwenForCausalLM(nn.Module):
             decode_end = time.perf_counter()
         
         
-        peak_memory_usage = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else torch.accelerator.memory.max_memory_allocated()
-
+        peak_memory_usage = torch.accelerator.memory.max_memory_allocated()
         decode_metrics = {
             "decode_start": decode_start,
             "decode_end": decode_end,
@@ -664,27 +599,16 @@ class QwenForCausalLM(nn.Module):
         }
     
         return input_ids, decode_metrics
-        
 
-    def make_kv_cache(self, batch_size, max_tokens, device):
-        num_kv_heads = self.config['num_key_value_heads']
-        head_dim = self.config['head_dim']
-        
-        self.kv_cache = []
-        self.cache_position = 0
-        for _ in range(self.config['num_hidden_layers']):
-            k_buff = torch.zeros(batch_size,num_kv_heads, max_tokens, head_dim, device = device, dtype=torch.float32)
-            v_buff = torch.zeros(batch_size,num_kv_heads, max_tokens, head_dim, device = device, dtype=torch.float32)
-            self.kv_cache.append([k_buff, v_buff]) #seq len == 0 at first
-        print(f'Cache created \n')
-
+    
     def calc_after_rotary_emb(self, q, k, v, device, prefill = False, seq_len = None):
         if prefill:
             assert isinstance(seq_len, int), "For prefill, seq len needs to be defined for causal mask"
         num_key_value_groups = int(self.config['num_attention_heads'] / self.config['num_key_value_heads'])
         k = repeat_kv(k, num_key_value_groups)
         v = repeat_kv(v, num_key_value_groups)
-    
+
+        # print(q.shape, k.shape, q.dtype, k.dtype)
         scores = torch.matmul(
             q, k.transpose(-2, -1)
         )
@@ -738,16 +662,12 @@ class QwenForCausalLM(nn.Module):
                 cos, sin = decoder_layer.self_attn.rotary_emb(q, position_ids)
                 q,k = apply_rotary_pos_emb(q, k, cos, sin)
 
-                #store in kv cache
-                k_buff, v_buff = self.kv_cache[i]
                 # print(k_buff.shape, v_buff.shape, cur_len)
-                k_buff[:, :, :T, :] = k
-                v_buff[:, :, :T, :] = v
+                #update the kv cache
+                self.kv_cache.cache[i].k[:, : ,:T, :] = k
+                self.kv_cache.cache[i].v[:, :, :T, :] = v
 
-                # print(f'Writing cache upto timestep t = {T}\n')
-
-                #update the kv_cache
-                self.kv_cache[i] = [k_buff, v_buff]
+                self.kv_cache.cache[i].seq_len = T
 
                 #full causal attention score
                 output = self.calc_after_rotary_emb(q, k, v,
@@ -788,7 +708,6 @@ class QwenForCausalLM(nn.Module):
             prefill_end = time.perf_counter()
         
             # print(logits.shape)
-            self.cache_position = T
             
         next_token = sample_next_token(logits[:, -1, :],temperature = temp,
                                        top_k = top_k, top_p = top_p)
@@ -807,37 +726,38 @@ class QwenForCausalLM(nn.Module):
 
         return next_token, current_position, prefill_metrics
 
-    def warmup_with_cache(self, input_ids, max_new_tokens, temp, top_k, top_p):
+    def warmup_with_cache(self, input_ids, temp, top_k, top_p):
         
         #create the cache here
         num_warmups = 5
+        print(input_ids)
         B, T = input_ids.shape
-
-        max_tokens = T + max_new_tokens
-        self.make_kv_cache(B, max_tokens, device = input_ids.device)
         
         for i in range(num_warmups):
             print(f'Warmup step = {i+1}')
             _, _, _ = self.prefill_with_cache(input_ids, temp = temp, top_p = top_p, top_k = top_k)
+
+        print(f'Reset seq len to 0\n')
+        for i in range(self.model.config["num_hidden_layers"]):
+            self.kv_cache.cache[i].seq_len = 0
+        
         synchronize()
 
 
-    def decode_with_cache(self, next_token, max_new_tokens, current_position,
-                          temp, top_k, top_p):
+    def decode_with_cache(self, next_token, current_position, temp, top_k, top_p, 
+                          max_new_tokens = 2048):
+
+        generated_count = 0
         generated_tokens = []
         token_times = []
-    
+        
         decode_start = time.perf_counter()
         self.eval()
     
         with torch.no_grad():
-            for step in range(max_new_tokens -1):
-                # if step % 100 == 0:
-                #     print(f'Decoding on step = {step}')
+            while next_token.item() != 152643 and generated_count != max_new_tokens - 1:
 
                 B, T = next_token.shape
-
-                synchronize()
                 token_start = time.perf_counter()
     
                 hidden_states = self.model.embed_tokens(next_token)
@@ -858,19 +778,14 @@ class QwenForCausalLM(nn.Module):
     
                     cos, sin = decoder_layer.self_attn.rotary_emb(q, position_ids)
                     q, k = apply_rotary_pos_emb(q, k, cos, sin)
-    
-                    # write new k/v into the cache
-                    k_cache, v_cache = self.kv_cache[i]
-                    k_cache[:, :, self.cache_position:self.cache_position + 1, :] = k
-                    v_cache[:, :, self.cache_position:self.cache_position + 1, :] = v
-                    self.kv_cache[i] = [k_cache, v_cache]
-    
-                    # read back the FULL history (prompt + generated so far) to attend against
-                    k_full = k_cache[:, :, :self.cache_position + 1, :]
-                    v_full = v_cache[:, :, :self.cache_position + 1, :]
+                    
+                    #update the cache
+                    # print(f'new token\n')
+                    # print(k.shape, v.shape)
+                    k, v = self.kv_cache.update(i, k, v)
     
                     output = self.calc_after_rotary_emb(
-                        q, k_full, v_full,
+                        q, k, v,
                         device=next_token.device,
                         prefill=False,
                     )
@@ -896,8 +811,6 @@ class QwenForCausalLM(nn.Module):
                 # final norm applied ONCE, after all layers
                 hidden_states = self.model.norm(hidden_states)
     
-                self.cache_position += 1
-    
                 logits = F.linear(hidden_states, self.model.embed_tokens.weight)
     
                 #sampling
@@ -910,12 +823,12 @@ class QwenForCausalLM(nn.Module):
                 generated_tokens.append(next_token.item())
                 token_times.append(token_end - token_start)
                 current_position += 1
+                generated_count += 1
     
             synchronize()
             decode_end = time.perf_counter()
             
-        peak_memory_usage = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else torch.accelerator.memory.max_memory_allocated()
-        
+        peak_memory_usage = torch.accelerator.memory.max_memory_allocated()
         decode_metrics = {
             "decode_start": decode_start,
             "decode_end": decode_end,
@@ -929,15 +842,14 @@ class QwenForCausalLM(nn.Module):
         }
     
         return generated_tokens, decode_metrics
-    
-    
+
                 
-    def generate(self, tokenizer,  input_ids, max_new_tokens, temp, top_k, top_p, use_cache = False):
+    def generate(self, tokenizer, input_ids, temp, top_k, top_p, use_cache = False, max_new_tokens = 1024):
         
         input_string_ids = input_ids
         print(f'Status : use_cache is {use_cache}')
 
-        root_dir = './metrics'
+        root_dir = 'metrics_new'
         os.makedirs(root_dir, exist_ok = True)
         if use_cache:
             label = f'cache_{max_new_tokens}.json'
@@ -949,53 +861,48 @@ class QwenForCausalLM(nn.Module):
         assert file_path is not None , "Please ensure the file path is defined"
 
         #reset peak memory for every generate
-
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
-        #torch.mps.empty_cache()
-        #as reset not available, run all code at once, new init
+        # torch.cuda.reset_peak_memory_stats()
 
         self.eval()
         if not use_cache:
             with torch.no_grad():
                 #warmup for some steps
                 self.warmup_without_cache(input_ids)
-
-                #torch.cuda.reset_peak_memory_stats()
-
+                
+                # torch.cuda.reset_peak_memory_stats()
+                
                 #prefill without cache
                 prefill_metrics, input_ids = self.prefill_without_cache(input_ids, temp = temp, top_k = top_k, top_p = top_p)
                 #decode_without_cache(self, input_ids, temp, top_k, top_p, max_new_tokens=100)
                 #decode without cache
-                input_ids, decode_metrics = self.decode_without_cache(input_ids, temp = temp, top_k = top_k, top_p = top_p, max_new_tokens = max_new_tokens)
+                input_ids, decode_metrics = self.decode_without_cache(input_ids, temp = temp, top_k = top_k, top_p = top_p, max_new_tokens = 256)
 
         else:
             with torch.no_grad():
                 
                 #warmup with cache
                 #cache is created inside and the same cache is used for this generation
-                self.warmup_with_cache(input_ids, max_new_tokens, temp = temp, top_k = top_k, top_p = top_p)
-
-                #reset the cache
-                self.cache_position = 0
+                self.warmup_with_cache(input_ids, temp = temp, top_k = top_k, top_p = top_p)
 
                 #after warmup reset the max memory
                 # torch.cuda.reset_peak_memory_stats()
                 
                 #prefill
                 next_token, current_position, prefill_metrics = self.prefill_with_cache(input_ids, temp, top_k, top_p)
+                
                 #decode
                 generated_tokens, decode_metrics = self.decode_with_cache(
-                    next_token = next_token, max_new_tokens = max_new_tokens,
-                    current_position = current_position, temp = temp, top_k = top_k, top_p = top_p)
+                    next_token = next_token, current_position = current_position,
+                    temp = temp, top_k = top_k, top_p = top_p)
 
         if not use_cache:
             generated_tokens = input_ids.squeeze(0).tolist()
         
         print_and_save_metrics(prefill_metrics, decode_metrics, file_path = file_path)
 
+            
         #deocode here
-        print(f'Metrics saved to file {file_path}\n\n')
+        print(f'Metrics saved to file {None}\n\n')
         text = tokenizer.decode(input_ids.squeeze(0).tolist())
         text+= tokenizer.decode(generated_tokens)
         return text

@@ -18,7 +18,7 @@ with open("./qwen2.5-0.5b-Instruct/config.json") as f:
 config['head_dim'] = int(config['hidden_size'] / config['num_attention_heads'])
 
 
-model = QwenForCausalLM(config = config).to(device)
+model = QwenForCausalLM(config = config, device = device).to(device)
 
 weights = load_file(
     "./qwen2.5-0.5b-Instruct/model.safetensors"
@@ -28,7 +28,7 @@ print(f'Model Weights loaded\n')
 
 tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
 
-prompt = "Terence Tao recently said that millenial maths problems are like non-renewable energy. AI is becoming"
+prompt = "Explain me the Multi Latent Attention in detail/"
 
 input_ids = tokenizer.encode(prompt, return_tensors='pt').to(device)
 
@@ -39,7 +39,7 @@ sample_config = {
 }
 
 
-text = model.generate(tokenizer, input_ids, max_new_tokens = 1024, temp = sample_config['temperature'], top_k = sample_config['top_k'], top_p = sample_config['top_p'], use_cache = False)
+text = model.generate(tokenizer, input_ids, temp = sample_config['temperature'], top_k = sample_config['top_k'], top_p = sample_config['top_p'], use_cache = False)
 
 
 print(text)
