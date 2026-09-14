@@ -1,3 +1,4 @@
+import os
 import json
 import torch
 import torch.nn.functional as F
@@ -35,7 +36,19 @@ def sample_next_token(logits, temperature=1.0, top_k=0, top_p=1.0):
     return torch.multinomial(probs, num_samples=1)
 
 
-def print_and_save_metrics(prefill_metrics, decode_metrics, file_path=None):
+def print_and_save_metrics(prefill_metrics, decode_metrics, use_cache, max_new_tokens):
+
+    root_dir = './metrics_new'
+    os.makedirs(root_dir, exist_ok = True)
+    if use_cache:
+        label = f'cache_{max_new_tokens}.json'
+    else:
+        label = f'no_cache_{max_new_tokens}.json'
+        
+    file_path = os.path.join(root_dir, label)
+
+    assert file_path is not None , "Please ensure the file path is defined"
+    
     prefill_time = (prefill_metrics['prefill_end'] -  prefill_metrics['prefill_start'])* 1000
     ttft = prefill_metrics['ttft'] *  1000
     decode_time = decode_metrics['decode_time'] * 1000

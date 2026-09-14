@@ -500,16 +500,16 @@ class QwenForCausalLM(nn.Module):
         return logits
 
     def warmup_without_cache(self, input_ids):
-        self.model.eval()
+        self.eval()
         print(f'warming up without cache for 5 steps\n')
         with torch.no_grad():
             for _ in range(5):
-                self.model(input_ids)
+                self(input_ids)
     
     def prefill_without_cache(self, input_ids, temp, top_p, top_k):
         #prefill
         print(f'Executing Prefill')
-        self.model.eval()
+        self.eval()
 
         with torch.no_grad():
             #sync
@@ -732,6 +732,7 @@ class QwenForCausalLM(nn.Module):
         num_warmups = 5
         print(input_ids)
         B, T = input_ids.shape
+        self.eval()
         
         for i in range(num_warmups):
             print(f'Warmup step = {i+1}')
@@ -848,18 +849,7 @@ class QwenForCausalLM(nn.Module):
         
         input_string_ids = input_ids
         print(f'Status : use_cache is {use_cache}')
-
-        root_dir = './metrics_new'
-        os.makedirs(root_dir, exist_ok = True)
-        if use_cache:
-            label = f'cache_{max_new_tokens}.json'
-        else:
-            label = f'no_cache_{max_new_tokens}.json'
-            
-        file_path = os.path.join(root_dir, label)
-
-        assert file_path is not None , "Please ensure the file path is defined"
-
+        
         #reset peak memory for every generate
         # torch.cuda.reset_peak_memory_stats()
 
@@ -898,7 +888,7 @@ class QwenForCausalLM(nn.Module):
         if not use_cache:
             generated_tokens = input_ids.squeeze(0).tolist()
         
-        print_and_save_metrics(prefill_metrics, decode_metrics, file_path = file_path)
+        print_and_save_metrics(prefill_metrics, decode_metrics, file_path = file_path, use_cache = use_cache)
 
             
         #deocode here
