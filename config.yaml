@@ -1,0 +1,8 @@
+path_config:
+  weights_path: "./qwen2.5-0.5b-Instruct/model.safetensors"
+  model_config_path: "./qwen2.5-0.5b-Instruct/config.json"
+
+sample_config:
+  temperature: 1.0
+  top_k: 50
+  top_p: 0.9
